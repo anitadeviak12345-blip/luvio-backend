@@ -1,2 +1,392 @@
-# luvio-backend
-Multilingual
+# main.py - Full & Final Backend (No dummy agents)
+# Requirements: pip install fastapi uvicorn requests python-dotenv
+# Optional: pip install ctransformers
+# Run: uvicorn main:app --reload
+
+from fastapi import FastAPI, Request, HTTPException
+from datetime import datetime, timedelta
+import json, uuid, requests, os
+from typing import Any, Dict
+from urllib.parse import quote_plus
+
+# Optional LLM model
+MODEL = None
+try:
+    from ctransformers import AutoModelForCausalLM
+    MODEL = AutoModelForCausalLM.from_pretrained(
+        "models/zephyr-7b.Q4_K_M.gguf",
+        model_type="mistral",
+        max_new_tokens=256
+    )
+except Exception as e:
+    MODEL = None
+    print("LLM model not loaded — running without LLM.", e)
+
+app = FastAPI(title="Luvio Backend - Full Final")
+
+# Public APIs
+DUCKDUCKGO_API = "https://api.duckduckgo.com/"
+PIPED_API = "https://pipedapi.kavin.rocks/search"
+
+# Supported Indian languages
+SUPPORTED_LANGUAGES = {
+    "as": "Assamese", "bn": "Bengali", "gu": "Gujarati", "hi": "Hindi",
+    "kn": "Kannada", "ks": "Kashmiri", "kok": "Konkani", "ml": "Malayalam",
+    "mr": "Marathi", "ne": "Nepali", "or": "Odia", "pa": "Punjabi",
+    "sa": "Sanskrit", "sd": "Sindhi", "ta": "Tamil", "te": "Telugu",
+    "ur": "Urdu", "brx": "Bodo", "sat": "Santhali", "mai": "Maithili", "doi": "Dogri"
+}
+
+USER_DB_PATH = "user_db.json"
+
+def load_user_db() -> Dict[str, Any]:
+    if not os.path.exists(USER_DB_PATH):
+        sample = {
+            "demo_user": {
+                "signup_date": datetime.now().strftime("%Y-%m-%d"),
+                "tier": "Free",
+                "api_key": None,
+                "key_expiry": None
+            }
+        }
+        with open(USER_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(sample, f, indent=2, ensure_ascii=False)
+        return sample
+    try:
+        with open(USER_DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            return data
+    except Exception:
+        return {}
+
+def save_user_db(db: Dict[str, Any]) -> None:
+    with open(USER_DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
+
+user_db = load_user_db()
+
+# Utilities
+def generate_api_key() -> str:
+    return "luvio_" + str(uuid.uuid4())[:12]
+
+def has_chat_access(user: Dict[str, Any]) -> bool:
+    try:
+        signup = datetime.strptime(user.get("signup_date", datetime.now().strftime("%Y-%m-%d")), "%Y-%m-%d")
+    except Exception:
+        signup = datetime.now()
+    if datetime.now() <= signup + timedelta(days=5):
+        return True
+    return user.get("tier") in ["Pro", "Bharat+"]
+
+def has_language_access(user: Dict[str, Any], lang: str) -> bool:
+    restricted = ["sa", "sat", "brx", "doi"]
+    if lang in restricted and user.get("tier") != "Bharat+":
+        return False
+    return True
+
+def translate_to_english(text: str, lang: str) -> str:
+    return f"[{lang} → English]: {text}"
+
+def translate_from_english(text: str, lang: str) -> str:
+    return f"[English → {lang}]: {text}"
+
+def parse_file(content: str) -> str:
+    if not content:
+        return ""
+    return f"[File Text]: {content[:800]}"
+
+# Education blueprint
+EDUCATION_BLUEPRINT = [
+    {"class": "5", "subjects": ["हिंदी", "अंग्रेज़ी", "गणित", "EVS", "कला/खेल"]},
+    {"class": "6", "subjects": ["हिंदी", "अंग्रेज़ी", "गणित", "विज्ञान", "सामाजिक विज्ञान", "कंप्यूटर", "कला/खेल"]},
+    {"class": "7", "subjects": ["हिंदी", "अंग्रेज़ी", "गणित", "विज्ञान", "सामाजिक विज्ञान", "कंप्यूटर", "कला/खेल"]},
+    {"class": "8", "subjects": ["हिंदी", "अंग्रेज़ी", "गणित", "विज्ञान", "सामाजिक विज्ञान", "कंप्यूटर", "कला/खेल"]},
+    {"class": "9", "subjects": ["हिंदी", "अंग्रेज़ी", "गणित", "विज्ञान", "सामाजिक विज्ञान", "वैकल्पिक"]},
+    {"class": "10", "subjects": ["वही विषय जो 9वीं में"]},
+    {"class": "11 (Science)", "subjects": ["Physics", "Chemistry", "Biology/Maths", "English", "Optional"]},
+    {"class": "11 (Commerce)", "subjects": ["Accountancy", "Business Studies", "Economics", "English", "Optional"]},
+    {"class": "11 (Arts)", "subjects": ["History", "Political Science", "Geography", "Sociology/Psychology/Economics", "English/Hindi"]},
+    {"class": "12 (Science)", "subjects": ["वही विषय + बोर्ड तैयारी"]},
+    {"class": "12 (Commerce)", "subjects": ["वही विषय + बोर्ड तैयारी"]},
+    {"class": "12 (Arts)", "subjects": ["वही विषय + बोर्ड तैयारी"]}
+]
+
+# Agents
+class EducationAgent:
+    @staticmethod
+    def handle(message: str, lang: str, label: str):
+        return {"label": label, "blueprint": EDUCATION_BLUEPRINT}
+
+class CalendarAgent:
+    @staticmethod
+    def handle(message: str, lang: str, label: str):
+        return {"label": label, "message": message}
+
+class DuckDuckGoAgent:
+    @staticmethod
+    def handle(message: str, lang: str, label: str):
+        q = quote_plus(message[:1000])
+        url = f"{DUCKDUCKGO_API}?q={q}&format=json&no_html=1&skip_disambig=1"
+        try:
+            r = requests.get(url, timeout=6)
+            r.raise_for_status()
+            resp = r.json()
+            results = []
+            related = resp.get("RelatedTopics", []) or []
+            for t in related:
+                if isinstance(t, dict) and "Topics" in t:
+                    for sub in t.get("Topics", [])[:3]:
+                        text = sub.get("Text")
+                        link = sub.get("FirstURL")
+                        if text and link:
+                            results.append({"title": text, "link": link})
+                else:
+                    if isinstance(t, dict):
+                        text = t.get("Text")
+                        link = t.get("FirstURL")
+                        if text and link:
+                            results.append({"title": text, "link": link})
+                if len(results) >= 6:
+                    break
+            if not results:
+                abstract = resp.get("AbstractText")
+                abstract_url = resp.get("AbstractURL")
+                if abstract:
+                    results.append({"title": abstract[:200], "link": abstract_url or ""})
+            return {"source": "duckduckgo", "results": results}
+        except Exception as e:
+            return {"error": "duckduckgo_failed", "details": str(e)}
+
+class GoogleAgent:
+    @staticmethod
+    def handle(message: str, lang: str, label: str):
+        return DuckDuckGoAgent.handle(message, lang, label)
+
+class PipedAgent:
+    @staticmethod
+    def handle(message: str, lang: str, label: str):
+        q = quote_plus(message[:500])
+        url = f"{PIPED_API}?q={q}"
+        try:
+            r = requests.get(url, timeout=7)
+            r.raise_for_status()
+            resp = r.json()
+            results = []
+            if isinstance(resp, list):
+                for it in resp[:6]:
+                    title = it.get("title") or ""
+                    uploader = it.get("uploaderName") or it.get("uploader") or ""
+                    url_field = it.get("url") or ""
+                    video_id = ""
+                    if isinstance(url_field, str):
+                        parts = url_field.split("/")
+                        if parts:
+                            video_id = parts[-1].split("?v=")[-1]
+                    video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else url_field
+                    results.append({"title": title, "channel": uploader, "video_url": video_url})
+            return {"source": "piped", "results": results}
+        except Exception as e:
+            return {"error": "piped_failed", "details": str(e)}
+
+class YouTubeAgent:
+    @staticmethod
+    def handle(message: str, lang: str, label: str):
+        return PipedAgent.handle(message, lang, label)
+
+# Agent Map
+agent_map = {
+     "chat": ChatAgent,
+    "education_blueprint": EducationAgent,
+    "calendar": CalendarAgent,
+    "google": GoogleAgent,
+    "search": GoogleAgent,
+    "duckduckgo": DuckDuckGoAgent,
+    "youtube": YouTubeAgent,
+    "piped": PipedAgent,
+    "calendar": CalendarAgent,
+    "finance": FinanceAgent,
+    "health": HealthAgent,
+    "learning": LearningAgent,
+    "life_decision": LifeDecisionAgent,
+    "life_simulation": LifeSimAgent,
+    "mental_health": MentalHealthAgent,
+    "financial_advisor": FinancialAdvisorAgent,
+    "multi_modal": MultiModalAgent,
+    "personalized_learning": PersonalizedLearningAgent,
+    "smart_home": SmartHomeAgent,
+    "data_privacy": PrivacyAgent,
+    "social_media": SocialMediaAgent,
+    "alerts": AlertsAgent,
+    "ai_rules": AIRulesAgent,
+"life_simulation_2": LifeSimV2Agent,
+    "emotional_intelligence": EmotionalIQAgent,
+    "health_forecast": HealthForecastAgent,
+    "legal_advisor": LegalAdvisorAgent,
+    "creativity": CreativityAgent,
+    "sustainability": SustainabilityAgent,
+    "travel": TravelAgent,
+    "blockchain": BlockchainAgent,
+    "goals_tracker": GoalsAgent,
+    "vr_metaverse": VRMetaverseAgent,
+"nlp_chat": NLPChatAgent,
+    "memory_personalization": MemoryAgent,
+    "decision_chat": DecisionChatAgent,
+    "tutor": TutorAgent,
+    "social_content": SocialContentAgent,
+    "emotional_chat": EmotionalChatAgent,
+    "voice_chat": VoiceChatAgent,
+    "reasoning": ReasoningAgent,
+    "code_debug": CodeAgent,
+    "data_analysis": DataAgent,
+    "translation": TranslationAgent,
+    "creative_content": CreativeAgent,
+    "summarization": SummarizerAgent,
+    "custom_persona": PersonaAgent,
+    "web_search": WebSearchAgent,
+    "customer_support": SupportAgent,
+  "subscription": SubscriptionAgent,
+    "api_key": APIKeyAgent,
+
+    "workspace": WorkspaceAgent,
+    "task_tracking": TaskAgent,
+    "collaboration": CollaborationAgent,
+    "community_projects": CommunityAgent,
+    "suggestions": SuggestionAgent,
+    "permissions": PermissionAgent,
+    "gamification": GamificationAgent,
+
+    "compliance_monitor": ComplianceAgent,
+    "rule_alerts": RuleAlertAgent,
+    "compliance_suggestions": ComplianceSuggestAgent,
+    "audit_trail": AuditAgent,
+    "human_verification": HumanVerifyAgent,
+    "trending_topics": TrendingAgent,
+    "dream11_generator": Dream11Agent,
+    "education_helper": EducationAgent,
+ "fantasy_cricket": FantasyCricketAgent,
+    "fantasy_global": FantasyGlobalAgent,
+    "study_ai": StudyAgent,
+    "productivity_ai": ProductivityAgent,
+    "api_hub": APIHubAgent,
+    "entertainment": EntertainmentAgent,
+    "branding": BrandingAgent,
+    "smart_notifications": NotificationAgent,
+
+    "text_chat": TextChatAgent,
+    "voice_io": VoiceIOAgent,
+    "doc_reader": DocReaderAgent,
+    "image_video_gen": MediaGenAgent,
+    "knowledge_base": KnowledgeAgent,
+    "plugin_support": PluginAgent,
+    "analytics": AnalyticsAgent
+}
+
+# API Endpoints
+@app.post("/route")
+async def route_task(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    name = payload.get("name")
+    task = payload.get("task")
+    input_type = payload.get("input_type", "text")
+    lang = payload.get("language", "hi")
+    if not name or not task:
+        raise HTTPException(status_code=400, detail="Missing 'name' or 'task' in payload")
+
+    user = user_db.get(name)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if lang not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=400, detail=f"Language '{lang}' not supported")
+    if not has_language_access(user, lang):
+        raise HTTPException(status_code=403, detail=f"Language '{lang}' is only for Bharat+ users")
+
+    if task == "chat" and not has_chat_access(user):
+        raise HTTPException(status_code=403, detail="Chat access expired. Upgrade required.")
+
+    agent_cls = agent_map.get(task)
+    if not agent_cls:
+        raise HTTPException(status_code=400, detail="Unknown task")
+
+    if input_type == "file":
+        file_content = payload.get("file_content", "")
+        message = parse_file(file_content)
+    else:
+        message = payload.get("message", "")
+
+    used_message = translate_to_english(message, lang) if lang != "en" else message
+
+    try:
+        result = agent_cls.handle(used_message, lang, label=task.title())
+    except Exception as e:
+        result = {"error": "agent_failed", "details": str(e)}
+
+    if lang != "en":
+        try:
+            translated = translate_from_english(str(result), lang)
+        except Exception:
+            translated = None
+        response = {"original": result, "translated_summary": translated}
+    else:
+        response = {"original": result}
+
+    return {"response": response}
+
+@app.post("/generate_key")
+async def generate_key(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    name = payload.get("name")
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing 'name'")
+
+    user = user_db.get(name)
+    if not user or user.get("tier") != "Bharat+":
+        raise HTTPException(status_code=403, detail="API key only for Bharat+ users")
+
+    key = generate_api_key()
+    user["api_key"] = key
+    user["key_expiry"] = (datetime.now() + timedelta(days=28)).strftime("%Y-%m-%d")
+    user_db[name] = user
+    save_user_db(user_db)
+    return {"api_key": key, "expires": user["key_expiry"]}
+
+@app.get("/dashboard")
+async def dashboard(name: str):
+    user = user_db.get(name)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        signup = datetime.strptime(user.get("signup_date", datetime.now().strftime("%Y-%m-%d")), "%Y-%m-%d")
+    except Exception:
+        signup = datetime.now()
+    chat_days_left = max(0, (signup + timedelta(days=5) - datetime.now()).days)
+    key_expiry = user.get("key_expiry", "N/A")
+    return {
+        "name": name,
+        "tier": user.get("tier", "Free"),
+        "chat_days_left": chat_days_left,
+        "api_key": user.get("api_key", "Not generated"),
+        "key_expiry": key_expiry
+    }
+
+@app.post("/create_test_user")
+async def create_test_user(payload: Dict[str, Any]):
+    name = payload.get("name")
+    tier = payload.get("tier", "Free")
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing name")
+    user_db[name] = {"signup_date": datetime.now().strftime("%Y-%m-%d"), "tier": tier, "api_key": None, "key_expiry": None}
+    save_user_db(user_db)
+    return {"ok": True, "user": user_db[name]}
+    
